@@ -1,6 +1,8 @@
-Flask
-pyTelegramBotAPI
-pandas
-yfinance
-TA-Lib
-requests
+pyTelegramBotAPI==4.12.0
+Flask==2.2.5
+gunicorn==22.1.0
+pandas==2.2.2
+numpy==1.26.4
+yfinance==0.2.26
+requests==2.31.0
+beautifulsoup4==4.12.2

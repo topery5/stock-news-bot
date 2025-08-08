@@ -1,2 +1,5 @@
 chat_ids.json
+last_sent.json
+bot.log
 __pycache__/
+.env

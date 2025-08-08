@@ -1,9 +1,0 @@
-services:
-  - type: worker
-    name: stock-news-bot
-    env: docker
-    dockerfilePath: ./Dockerfile
-    autoDeploy: true
-    envVars:
-      - key: BOT_TOKEN
-        value: "8433631932:AAGlzeHsbHeIEsgMB7D0wnD6y9zbrI0eKKo"

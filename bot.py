@@ -35,16 +35,22 @@ flask_app = Flask(__name__)
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
 # set Telegram command menu (will be called at startup via HTTP set webhook step)
-try:
-    application.bot.set_my_commands([
-        BotCommand("start", "Mulai bot"),
-        BotCommand("help", "Bantuan"),
-        BotCommand("harga", "Cek harga saham (multi)"),
-        BotCommand("stock", "Kartu saham (gambar)"),
-    ])
-except Exception:
-    # may fail at import-time on some platforms; fine, it's optional
-    pass
+import asyncio
+
+async def set_bot_commands():
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Mulai bot"),
+            BotCommand("help", "Bantuan"),
+            BotCommand("harga", "Cek harga saham (multi)"),
+            BotCommand("stock", "Kartu saham (gambar)"),
+        ])
+    except Exception:
+        # may fail at import-time on some platforms; fine, it's optional
+        pass
+
+# Run the async function to set commands at startup
+asyncio.run(set_bot_commands())
 
 # ---------------- utilities: fetch price & TA ----------------
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"

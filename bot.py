@@ -18,8 +18,8 @@ import telebot
 from flask import Flask, request
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")            # required
-APP_URL = os.getenv("APP_URL")                # required, e.g. https://yourapp.up.railway.app
+BOT_TOKEN = os.getenv("8433631932:AAGlzeHsbHeIEsgMB7D0wnD6y9zbrI0eKKo")            # required
+APP_URL = os.getenv("http://stock-news-bot-production.up.railway.app")                # required, e.g. https://yourapp.up.railway.app
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SEC", "300"))  # seconds, default 300 (5m)
 CHAT_FILE = "chat_ids.json"
 LAST_SENT_FILE = "last_sent.json"

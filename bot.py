@@ -227,13 +227,14 @@ def fetch_investing_rss(limit=5) -> List[Dict]:
         items = root.findall(".//item")[:limit]
         out = []
         for item in items:
-            title = item.find("title").text if item.find("title') is not None else ""
-            link = item.find("link").text if item.find("link') is not None else ""
+            title = item.find("title").text if item.find("title") is not None else ""
+            link = item.find("link").text if item.find("link") is not None else ""
             out.append({"title": title, "code": "", "link": link, "source": "Investing"})
         return out
     except Exception as e:
         logging.warning("fetch_investing_rss error: %s", e)
         return []
+
 
 def fetch_combined_news(limit=5) -> List[Dict]:
     # prefer IDX + CNBC; fallback to Investing RSS if needed

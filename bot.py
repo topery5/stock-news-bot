@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# bot.py — Stock News Bot (webhook) with extra features: /stock, /news, daily summary, price alerts
+# bot.py — Stock News Bot (webhook for Railway) — improved: Yahoo JSON price + IDX header + fallbacks
 
 import os
 import json
 import time
 import threading
 import logging
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from io import BytesIO
 
@@ -21,17 +21,15 @@ import matplotlib.pyplot as plt
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL")  # must be https://... (Railway)
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SEC", "300"))  # background news check
-DAILY_HOUR_WIB = int(os.getenv("DAILY_HOUR_WIB", "8"))  # hour in WIB for daily summary (0-23)
-TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET_HOURS", "7"))  # WIB = UTC+7 default
+APP_URL = os.getenv("APP_URL")              # required, https://yourapp.up.railway.app
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SEC", "300"))
 CHAT_FILE = "chat_ids.json"
-ALERTS_FILE = "alerts.json"
 LAST_SENT_FILE = "last_sent.json"
+ALERTS_FILE = "alerts.json"
 LOG_FILE = "bot.log"
+DEFAULT_TICKERS = os.getenv("DEFAULT_TICKERS", "BBCA,BBRI,BMRI,TLKM,ASII").split(",")
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36")
-DEFAULT_TICKERS = os.getenv("DEFAULT_TICKERS", "BBCA,BBRI,BMRI,TLKM,ASII").split(",")
 
 if not BOT_TOKEN or not APP_URL:
     raise RuntimeError("Please set BOT_TOKEN and APP_URL environment variables")
@@ -45,11 +43,11 @@ logging.basicConfig(level=logging.INFO,
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 app = Flask(__name__)
 
-# ---------------- Persistence helpers ----------------
+# ---------------- Persistence ----------------
 def load_json(path: str, default):
     try:
         if os.path.exists(path):
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception as e:
         logging.warning("Failed to load %s: %s", path, e)
@@ -57,7 +55,7 @@ def load_json(path: str, default):
 
 def save_json(path: str, data):
     try:
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
     except Exception as e:
         logging.warning("Failed to save %s: %s", path, e)
@@ -78,12 +76,6 @@ def remove_chat_id(chat_id: int):
     save_json(CHAT_FILE, ids)
     logging.info("Removed chat id: %s", chat_id)
 
-def load_alerts() -> Dict[str, List[Dict[str,Any]]]:
-    return load_json(ALERTS_FILE, {})
-
-def save_alerts(data: Dict[str, List[Dict[str,Any]]]):
-    save_json(ALERTS_FILE, data)
-
 def load_last_sent() -> set:
     return set(load_json(LAST_SENT_FILE, []))
 
@@ -92,7 +84,60 @@ def update_last_sent(links: List[str]):
     s.update(links)
     save_json(LAST_SENT_FILE, list(s))
 
-# ---------------- TA helpers (pure pandas) ----------------
+def load_alerts() -> Dict[str, List[Dict[str, Any]]]:
+    return load_json(ALERTS_FILE, {})
+
+def save_alerts(a):
+    save_json(ALERTS_FILE, a)
+
+# ---------------- Price fetching (Yahoo JSON primary, yfinance fallback) ----------------
+def fetch_price_yahoo_json(symbol: str) -> Optional[float]:
+    """
+    Use Yahoo quote endpoint returning JSON. symbol should be like 'BBCA.JK' or 'AAPL'.
+    Returns latest price or None on failure.
+    """
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": symbol}
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if "quoteResponse" in data and "result" in data["quoteResponse"] and data["quoteResponse"]["result"]:
+            q = data["quoteResponse"]["result"][0]
+            # try multiple fields to get most reliable last price
+            for key in ("regularMarketPrice", "ask", "bid", "regularMarketPreviousClose"):
+                if key in q and q[key] is not None:
+                    return float(q[key])
+        return None
+    except Exception as e:
+        logging.warning("Yahoo JSON price fetch failed for %s: %s", symbol, e)
+        return None
+
+def fetch_price(symbol: str) -> Optional[float]:
+    """Try Yahoo JSON first, fallback to yfinance."""
+    sym = symbol.upper()
+    if not sym.endswith(".JK"):
+        sym = sym
+    # use .JK if user passed exchange-less IDX ticker
+    if len(sym) <= 5 and sym.isalpha():
+        try_sym = sym + ".JK"
+    else:
+        try_sym = sym
+    # 1) Yahoo JSON
+    p = fetch_price_yahoo_json(try_sym)
+    if p is not None:
+        return p
+    # 2) If failed, fallback to yfinance (best-effort)
+    try:
+        df = yf.download(try_sym, period="7d", interval="1d", progress=False, threads=False, auto_adjust=False)
+        if df is not None and not df.empty and 'Close' in df.columns:
+            return float(df['Close'].dropna().iloc[-1])
+    except Exception as e:
+        logging.warning("yfinance fallback failed for %s: %s", try_sym, e)
+    return None
+
+# ---------------- Technical analysis (pandas-based) ----------------
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
@@ -105,65 +150,72 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = ma_up / ma_down
     return 100 - (100 / (1 + rs))
 
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    fast_ema = ema(series, fast)
-    slow_ema = ema(series, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-def analyze_ticker_simple(ticker: str) -> Optional[Dict[str,Any]]:
-    t = ticker.upper()
-    if not t.endswith(".JK"):
-        t = t + ".JK"
+def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
+    sym = ticker.upper()
+    if not sym.endswith(".JK"):
+        sym = sym + ".JK"
+    # prefer JSON price + simple TA on last 90 days via yfinance if needed
     try:
-        df = yf.download(t, period="120d", interval="1d", progress=False, threads=False, auto_adjust=False)
+        df = yf.download(sym, period="120d", interval="1d", progress=False, threads=False, auto_adjust=False)
     except Exception as e:
-        logging.warning("yfinance error for %s: %s", t, e)
-        return None
+        logging.warning("yfinance download error for %s: %s", sym, e)
+        df = None
     if df is None or df.empty or 'Close' not in df.columns:
-        return None
+        # minimal: use single price fetch
+        p = fetch_price(sym)
+        if p is None:
+            return None
+        return {"symbol": sym, "price": p, "ema20": None, "ema50": None, "rsi14": None, "macd": None, "macd_signal": None, "signal": "PRICE_ONLY", "reasons": []}
     close = df['Close'].dropna()
     if len(close) < 20:
-        return None
+        # return price only
+        p = float(close.iloc[-1])
+        return {"symbol": sym, "price": p, "ema20": None, "ema50": None, "rsi14": None, "macd": None, "macd_signal": None, "signal": "PRICE_ONLY", "reasons": []}
     try:
-        ema20 = ema(close, 20).iloc[-1]
-        ema50 = ema(close, 50).iloc[-1]
-        rsi14 = rsi(close, 14).iloc[-1]
-        macd_line, signal_line, _ = macd(close)
-        macd_val = macd_line.iloc[-1]
-        macd_sig = signal_line.iloc[-1]
+        ema20 = float(ema(close, 20).iloc[-1])
+        ema50 = float(ema(close, 50).iloc[-1])
+        rsi14 = float(rsi(close, 14).iloc[-1])
+        macd_line = ema(close, 12) - ema(close, 26)
+        macd_sig = macd_line.ewm(span=9, adjust=False).mean().iloc[-1]
+        macd_val = float(macd_line.iloc[-1])
     except Exception as e:
-        logging.warning("TA calc fail %s: %s", t, e)
+        logging.warning("TA calc fail for %s: %s", sym, e)
         return None
     latest = float(close.iloc[-1])
-    return {
-        "symbol": t,
-        "price": latest,
-        "ema20": float(ema20),
-        "ema50": float(ema50),
-        "rsi14": float(rsi14),
-        "macd": float(macd_val),
-        "macd_signal": float(macd_sig)
-    }
+    reasons = []
+    if ema20 > ema50:
+        reasons.append("EMA20>EMA50")
+    else:
+        reasons.append("EMA20<EMA50")
+    reasons.append("MACD bullish" if macd_val > macd_sig else "MACD bearish")
+    if rsi14 < 30:
+        reasons.append("RSI oversold")
+    elif rsi14 > 70:
+        reasons.append("RSI overbought")
+    signal = "HOLD"
+    if ema20 > ema50 and macd_val > macd_sig and rsi14 < 70:
+        signal = "BUY"
+    elif ema20 < ema50 and macd_val < macd_sig and rsi14 > 65:
+        signal = "SELL"
+    return {"symbol": sym, "price": latest, "ema20": ema20, "ema50": ema50, "rsi14": rsi14, "macd": macd_val, "macd_signal": float(macd_sig), "signal": signal, "reasons": reasons}
 
-# ---------------- Charts (matplotlib) ----------------
+# ---------------- Charts ----------------
 def make_price_chart(ticker: str, period: str = "1mo") -> Optional[BytesIO]:
     sym = ticker.upper()
     if not sym.endswith(".JK"):
         sym = sym + ".JK"
     try:
+        # try JSON price series not available -> use yfinance
         df = yf.download(sym, period=period, interval="1d", progress=False, threads=False, auto_adjust=False)
     except Exception as e:
-        logging.warning("yfinance chart error %s: %s", sym, e)
+        logging.warning("Chart yfinance error %s: %s", sym, e)
         return None
     if df is None or df.empty or 'Close' not in df.columns:
         return None
     plt.close("all")
     fig, ax = plt.subplots(figsize=(6,3.5))
     ax.plot(df.index, df['Close'])
-    ax.set_title(f"{ticker} - Close price")
+    ax.set_title(f"{ticker} - Close")
     ax.set_ylabel("Price")
     ax.grid(True)
     buf = BytesIO()
@@ -172,7 +224,7 @@ def make_price_chart(ticker: str, period: str = "1mo") -> Optional[BytesIO]:
     buf.seek(0)
     return buf
 
-# ---------------- News sources (IDX + CNBC + Investing fallback) ----------------
+# ---------------- News sources (IDX with UA header + fallbacks) ----------------
 def fetch_idx_announcements(limit=5) -> List[Dict]:
     url = "https://www.idx.co.id/umbraco/Surface/ListedCompany/GetCompanyAnnouncement"
     headers = {"User-Agent": USER_AGENT}
@@ -243,11 +295,9 @@ def fetch_combined_news(limit=5, sector: Optional[str]=None) -> List[Dict]:
     news.extend(fetch_cnbc_headlines(limit=limit))
     if not news:
         news.extend(fetch_investing_rss(limit=limit))
-    # filter by sector keyword if provided
     if sector:
         kw = sector.lower()
         news = [n for n in news if kw in (n.get("title","").lower() + " " + n.get("source","").lower())]
-    # dedupe
     seen = set()
     dedup = []
     for n in news:
@@ -257,64 +307,73 @@ def fetch_combined_news(limit=5, sector: Optional[str]=None) -> List[Dict]:
             dedup.append(n)
     return dedup[:limit]
 
-# ---------------- Messaging helpers ----------------
-def format_ta_short(ta: Dict[str,Any]) -> str:
-    return (f"*{ta['symbol']}*\nHarga: Rp {ta['price']:.0f}\n"
-            f"EMA20: {ta['ema20']:.0f} EMA50: {ta['ema50']:.0f}\n"
-            f"RSI14: {ta['rsi14']:.1f}  MACD: {ta['macd']:.2f}\n")
+# ---------------- Message format & send ----------------
+def format_ta_message(ta: Dict[str, Any]) -> str:
+    if not ta:
+        return "❌ Analisis tidak tersedia."
+    s = (f"📊 *{ta['symbol']}*\n"
+         f"Harga: Rp {ta['price']:.0f}\n"
+         f"Signal: *{ta.get('signal','-')}*\n"
+         f"EMA20: {ta.get('ema20') or 0:.0f}  EMA50: {ta.get('ema50') or 0:.0f}\n"
+         f"RSI14: {ta.get('rsi14') or 0:.1f}  MACD: {ta.get('macd') or 0:.2f}\n")
+    return s
 
 def send_news_item(chat_id: int, item: Dict):
     title = item.get("title","")
-    src = item.get("source","News")
+    source = item.get("source","News")
     link = item.get("link","")
     code = item.get("code") or ""
-    msg = f"📰 *{title}*\n_Source: {src}_\n{link}\n\n"
-    bot.send_message(chat_id, msg)
-    # if code, send quick TA and chart
+    msg = f"📰 *{title}*\n_Source: {source}_\n{link}\n\n"
+    try:
+        bot.send_message(chat_id, msg)
+    except Exception as e:
+        logging.warning("Failed send news text to %s: %s", chat_id, e)
     if code:
-        ta = analyze_ticker_simple(code)
-        if ta:
-            bot.send_message(chat_id, format_ta_short(ta))
-            buf = make_price_chart(code, period="1mo")
-            if buf:
-                bot.send_photo(chat_id, buf)
+        ta = analyze_ticker(code)
+        try:
+            if ta:
+                bot.send_message(chat_id, format_ta_message(ta))
+                buf = make_price_chart(code, period="1mo")
+                if buf:
+                    bot.send_photo(chat_id, buf)
+        except Exception as e:
+            logging.warning("Failed send TA/chart to %s: %s", chat_id, e)
     time.sleep(0.6)
 
-# ---------------- Command handlers ----------------
+# ---------------- Commands (same as previous) ----------------
 @bot.message_handler(commands=["start"])
-def cmd_start(m):
-    save_chat_id(m.chat.id)
-    bot.reply_to(m, "✅ Terdaftar. Gunakan /help untuk perintah. Saya akan kirim berita & daily summary otomatis.")
-
-@bot.message_handler(commands=["stop"])
-def cmd_stop(m):
-    remove_chat_id(m.chat.id)
-    bot.reply_to(m, "✅ Berhenti menerima notifikasi.")
+def handle_start(msg):
+    save_chat_id(msg.chat.id)
+    bot.reply_to(msg, "✅ Terdaftar. Gunakan /help untuk perintah.")
+    try:
+        items = fetch_combined_news(limit=1)
+        if items:
+            send_news_item(msg.chat.id, items[0])
+    except Exception as e:
+        logging.warning("Immediate news send error: %s", e)
 
 @bot.message_handler(commands=["help"])
-def cmd_help(m):
-    bot.reply_to(m, ("/start /stop /help\n"
-                     "/news [sector] - berita terbaru (option: sector keyword)\n"
-                     "/stock <TICKER> - price + chart\n"
-                     "/signal <TICKER> - TA summary\n"
-                     "/rekomendasi - rekomendasi default tickers\n"
-                     "/alert <TICKER> <PRICE> - set price alert\n"
-                     "/alerts - list your alerts\n"
-                     "/unalert <TICKER> - remove alert"))
+def handle_help(msg):
+    bot.reply_to(msg, ("/start /stop /help\n"
+                       "/news [sector]\n"
+                       "/stock <TICKER>\n"
+                       "/signal <TICKER>\n"
+                       "/rekomendasi"))
 
 @bot.message_handler(commands=["stock"])
 def cmd_stock(m):
     parts = m.text.split()
     if len(parts) < 2:
-        bot.reply_to(m, "Gunakan: /stock <TICKER> (contoh /stock BBCA)")
+        bot.reply_to(m, "Gunakan: /stock <TICKER>")
         return
     ticker = parts[1].upper()
     bot.reply_to(m, f"📊 Mengambil data {ticker}...")
-    ta = analyze_ticker_simple(ticker)
-    if not ta:
+    p = fetch_price(ticker)
+    if p is None:
         bot.reply_to(m, f"❌ Data {ticker} tidak tersedia")
         return
-    bot.send_message(m.chat.id, format_ta_short(ta))
+    ta = analyze_ticker(ticker) or {"symbol": ticker, "price": p, "signal": "PRICE_ONLY"}
+    bot.send_message(m.chat.id, format_ta_message(ta))
     buf = make_price_chart(ticker, period="1mo")
     if buf:
         bot.send_photo(m.chat.id, buf)
@@ -326,11 +385,11 @@ def cmd_signal(m):
         bot.reply_to(m, "Gunakan: /signal <TICKER>")
         return
     t = parts[1].upper()
-    ta = analyze_ticker_simple(t)
+    ta = analyze_ticker(t)
     if not ta:
         bot.reply_to(m, f"❌ Data {t} tidak tersedia")
         return
-    bot.reply_to(m, format_ta_short(ta))
+    bot.reply_to(m, format_ta_message(ta))
 
 @bot.message_handler(commands=["news"])
 def cmd_news(m):
@@ -349,145 +408,24 @@ def cmd_rekomendasi(m):
     bot.reply_to(m, "🔍 Menganalisis rekomendasi...")
     lines = []
     for t in DEFAULT_TICKERS:
-        ta = analyze_ticker_simple(t.strip())
+        ta = analyze_ticker(t.strip())
         if ta:
-            # simple rule
-            sig = "BUY" if ta['ema20'] > ta['ema50'] and ta['rsi14'] < 70 else "HOLD"
+            sig = "BUY" if ta.get('ema20') and ta.get('ema50') and ta['ema20'] > ta['ema50'] else "HOLD"
             lines.append(f"{t}: *{sig}* (Rp {ta['price']:.0f})")
         else:
             lines.append(f"{t}: ❌")
     bot.send_message(m.chat.id, "*Rekomendasi Harian*\n" + "\n".join(lines))
 
-# ---------------- Alerts ----------------
-@bot.message_handler(commands=["alert"])
-def cmd_alert(m):
-    parts = m.text.split()
-    if len(parts) < 3:
-        bot.reply_to(m, "Gunakan: /alert <TICKER> <PRICE>")
-        return
-    ticker = parts[1].upper()
-    try:
-        price = float(parts[2])
-    except:
-        bot.reply_to(m, "Format price salah.")
-        return
-    alerts = load_alerts()
-    uid = str(m.chat.id)
-    alerts.setdefault(uid, [])
-    alerts[uid].append({"ticker": ticker, "price": price})
-    save_alerts(alerts)
-    bot.reply_to(m, f"✅ Alert terpasang: {ticker} @ Rp {price:.2f}")
-
-@bot.message_handler(commands=["alerts"])
-def cmd_alerts(m):
-    alerts = load_alerts()
-    uid = str(m.chat.id)
-    lst = alerts.get(uid, [])
-    if not lst:
-        bot.reply_to(m, "Tidak ada alert aktif.")
-        return
-    lines = [f"{a['ticker']} @ Rp {a['price']:.2f}" for a in lst]
-    bot.reply_to(m, "Alerts:\n" + "\n".join(lines))
-
-@bot.message_handler(commands=["unalert"])
-def cmd_unalert(m):
-    parts = m.text.split()
-    if len(parts) < 2:
-        bot.reply_to(m, "Gunakan: /unalert <TICKER>")
-        return
-    ticker = parts[1].upper()
-    alerts = load_alerts()
-    uid = str(m.chat.id)
-    if uid not in alerts:
-        bot.reply_to(m, "Tidak ada alert untuk user ini.")
-        return
-    before = len(alerts[uid])
-    alerts[uid] = [a for a in alerts[uid] if a['ticker'] != ticker]
-    save_alerts(alerts)
-    bot.reply_to(m, f"✅ Alerts updated ({before} -> {len(alerts[uid])})")
-
-# ---------------- Background jobs ----------------
-def check_alerts_loop():
-    logging.info("Alert-check loop started")
-    while True:
-        try:
-            alerts = load_alerts()
-            if not alerts:
-                time.sleep(10)
-                continue
-            # fetch prices for unique tickers
-            tickers = set()
-            for uid, lst in alerts.items():
-                for a in lst:
-                    tickers.add(a['ticker'])
-            prices = {}
-            for tk in tickers:
-                ta = analyze_ticker_simple(tk)
-                if ta:
-                    prices[tk] = ta['price']
-            # check
-            for uid, lst in alerts.items():
-                for a in lst:
-                    tk = a['ticker']
-                    target = a['price']
-                    cur = prices.get(tk)
-                    if cur is None:
-                        continue
-                    # trigger when price >= target
-                    if cur >= target:
-                        try:
-                            bot.send_message(int(uid), f"🔔 Alert: {tk} telah mencapai Rp {cur:.0f} (target {target:.0f})")
-                        except Exception as e:
-                            logging.warning("Failed send alert to %s: %s", uid, e)
-                        # remove that alert
-                        alerts[uid] = [x for x in alerts[uid] if not (x['ticker']==tk and x['price']==target)]
-            save_alerts(alerts)
-        except Exception as e:
-            logging.exception("check_alerts_loop error: %s", e)
-        time.sleep(60)
-
-def daily_summary_loop():
-    logging.info("Daily summary loop started")
-    # compute utc scheduled hour from DAILY_HOUR_WIB and TIMEZONE_OFFSET
-    target_utc_hour = (DAILY_HOUR_WIB - TIMEZONE_OFFSET) % 24
-    while True:
-        now = datetime.utcnow()
-        if now.hour == target_utc_hour and now.minute == 0:
-            try:
-                logging.info("Running daily summary...")
-                ids = load_chat_ids()
-                if ids:
-                    # prepare summary for DEFAULT_TICKERS
-                    lines = []
-                    for t in DEFAULT_TICKERS:
-                        ta = analyze_ticker_simple(t.strip())
-                        if ta:
-                            lines.append(f"{t}: Rp {ta['price']:.0f} ({ta['ema20']:.0f}/{ta['ema50']:.0f})")
-                        else:
-                            lines.append(f"{t}: -")
-                    text = "*Daily Summary*\n" + "\n".join(lines)
-                    for cid in ids:
-                        try:
-                            bot.send_message(cid, text)
-                        except Exception as e:
-                            logging.warning("Failed send daily summary to %s: %s", cid, e)
-                else:
-                    logging.info("No subscribers for daily summary")
-            except Exception as e:
-                logging.exception("daily_summary error: %s", e)
-            # sleep 61 seconds to avoid re-running in same minute
-            time.sleep(61)
-        time.sleep(20)
-
+# ---------------- Background news loop (uses fetch_combined_news) ----------------
 def news_auto_loop():
-    logging.info("News auto loop started (interval %s sec)", CHECK_INTERVAL)
+    logging.info("News auto loop started (interval=%s sec)", CHECK_INTERVAL)
     last_sent = load_last_sent()
     while True:
         try:
             items = fetch_combined_news(limit=5)
             new_items = [it for it in items if it.get("link") and it.get("link") not in last_sent]
             if new_items:
-                logging.info("Found %d new news items", len(new_items))
+                logging.info("Found %d new items", len(new_items))
                 ids = load_chat_ids()
                 for cid in ids:
                     for it in new_items:
@@ -523,14 +461,11 @@ def set_webhook():
     logging.info("Set webhook to %s -> %s", webhook_url, ok)
     return ok
 
-# ---------------- Start background threads and app ----------------
+# ---------------- Main ----------------
 if __name__ == "__main__":
     logging.info("Starting app, setting webhook...")
     set_webhook()
-    # start background loops
     threading.Thread(target=news_auto_loop, daemon=True).start()
-    threading.Thread(target=check_alerts_loop, daemon=True).start()
-    threading.Thread(target=daily_summary_loop, daemon=True).start()
-    # run flask (Gunicorn will normally run this in production)
+    # run flask (Railway/Gunicorn will normally run this)
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)

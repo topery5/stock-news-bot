@@ -31,7 +31,7 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 log = logging.getLogger(__name__)
 
 # ---------------- Flask + Telegram app ----------------
-flask_app = Flask(__name__)
+app = Flask(__name__)
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
 # set Telegram command menu (will be called at startup via HTTP set webhook step)

@@ -1,35 +1,39 @@
-#!/usr/bin/env python3
-# bot.py — Stock News Bot (news + TA + commands)
-
-import os
-import time
-import json
-import threading
-import requests
-from datetime import datetime
-import pandas as pd
-import yfinance as yf
 import telebot
-from bs4 import BeautifulSoup
+import os
+import json
+import time
+import requests
+import pandas as pd
+import talib
+import yfinance as yf
+from datetime import datetime
+from threading import Thread
 
-# ---------------- CONFIG ----------------
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # set this in Railway / env
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SEC", "300"))  # default 300s (5 minutes)
+# ================== CONFIG ==================
+TOKEN = os.getenv("BOT_TOKEN")  # Ambil dari Render ENV
 CHAT_FILE = "chat_ids.json"
-DEFAULT_TICKERS = os.getenv("DEFAULT_TICKERS",
-    "BBCA,BBRI,BMRI,TLKM,ASII,UNVR,ICBP,ADRO,ANTM,MDKA").split(",")
-KEYWORDS = [k.strip().lower() for k in os.getenv("KEYWORDS", "backdoor listing,ipo,akuisisi").split(",")]
+CHECK_INTERVAL = 300  # 5 menit
+LOG_FILE = "bot.log"
 
 bot = telebot.TeleBot(TOKEN)
+last_sent_links = set()
 
-# ------------- Persistence Chat IDs -------------
+# ================== UTIL LOGGING ==================
+def log(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    print(line)
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+
+# ================== CHAT ID STORAGE ==================
 def load_chat_ids():
-    if os.path.exists(CHAT_FILE):
-        try:
+    try:
+        if os.path.exists(CHAT_FILE):
             with open(CHAT_FILE, "r") as f:
                 return json.load(f)
-        except:
-            return []
+    except:
+        return []
     return []
 
 def save_chat_id(chat_id):
@@ -38,277 +42,146 @@ def save_chat_id(chat_id):
         ids.append(chat_id)
         with open(CHAT_FILE, "w") as f:
             json.dump(ids, f)
+        log(f"✅ Chat ID tersimpan: {chat_id}")
 
-def remove_chat_id(chat_id):
-    ids = load_chat_ids()
-    if str(chat_id) in [str(x) for x in ids]:
-        ids = [x for x in ids if str(x) != str(chat_id)]
-        with open(CHAT_FILE, "w") as f:
-            json.dump(ids, f)
-
-# ------------- Simple TA helpers (pandas) -------------
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/period, min_periods=period).mean()
-    ma_down = down.ewm(alpha=1/period, min_periods=period).mean()
-    rs = ma_up / ma_down
-    return 100 - (100 / (1 + rs))
-
-def macd(series, fast=12, slow=26, signal=9):
-    fast_ema = ema(series, fast)
-    slow_ema = ema(series, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-# ------------- Analisis teknikal per ticker -------------
-def analyze_ticker(ticker):
-    """
-    ticker: e.g. 'BBCA' -> uses 'BBCA.JK' on Yahoo Finance
-    returns dict or None
-    """
-    sym = ticker.upper()
-    if not sym.endswith(".JK"):
-        sym = sym + ".JK"
+# ================== ANALISIS TEKNIKAL ==================
+def get_signal(symbol):
     try:
-        df = yf.download(sym, period="120d", interval="1d", progress=False, threads=False)
-    except Exception:
-        return None
-    if df is None or df.empty:
-        return None
-    close = df["Close"].dropna()
-    vol = df["Volume"].dropna()
-    if len(close) < 30:
-        return None
+        df = yf.download(f"{symbol}.JK", period="6mo", interval="1d", progress=False, threads=True)
+        if df.empty:
+            return "❌ Data tidak tersedia"
 
-    ema20 = ema(close, 20).iloc[-1]
-    ema50 = ema(close, 50).iloc[-1]
-    rsi14 = rsi(close, 14).iloc[-1]
-    macd_line, signal_line, hist = macd(close)
-    macd_val = macd_line.iloc[-1]
-    signal_val = signal_line.iloc[-1]
-    latest_price = close.iloc[-1]
+        df['EMA20'] = talib.EMA(df['Close'], timeperiod=20)
+        df['EMA50'] = talib.EMA(df['Close'], timeperiod=50)
+        df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
+        macd, signal_line, hist = talib.MACD(df['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
 
-    vol_sma20 = vol.rolling(20).mean().iloc[-1] if len(vol) >= 20 else vol.mean()
-    vol_ratio = (vol.iloc[-1] / vol_sma20) if vol_sma20 and vol_sma20 > 0 else 1.0
+        last = df.iloc[-1]
 
-    # Recent high/low (60 days)
-    recent_high = close[-60:].max()
-    recent_low = close[-60:].min()
+        trend = "📈 BUY" if last['EMA20'] > last['EMA50'] else "📉 SELL"
+        if 30 < last['RSI'] < 70:
+            rsi_status = "⚖️ NETRAL"
+        elif last['RSI'] <= 30:
+            rsi_status = "🟢 OVERSOLD"
+        else:
+            rsi_status = "🔴 OVERBOUGHT"
 
-    # Simple rule-based signal
-    reasons = []
-    signal = "HOLD"
-    if ema20 > ema50:
-        reasons.append("EMA20>EMA50")
-    else:
-        reasons.append("EMA20<EMA50")
+        macd_status = "📈 BULLISH" if macd.iloc[-1] > signal_line.iloc[-1] else "📉 BEARISH"
 
-    if macd_val > signal_val:
-        reasons.append("MACD bullish")
-    else:
-        reasons.append("MACD bearish")
+        return f"{trend} | {rsi_status} | {macd_status}"
+    except Exception as e:
+        log(f"Error get_signal {symbol}: {e}")
+        return "❌ Data tidak tersedia"
 
-    if rsi14 < 30:
-        reasons.append("RSI oversold")
-    elif rsi14 > 70:
-        reasons.append("RSI overbought")
-
-    if ema20 > ema50 and macd_val > signal_val and rsi14 < 70:
-        signal = "BUY"
-    elif ema20 < ema50 and macd_val < signal_val and rsi14 > 65:
-        signal = "SELL"
-    else:
-        signal = "HOLD"
-
-    return {
-        "symbol": sym,
-        "price": float(latest_price),
-        "ema20": float(ema20),
-        "ema50": float(ema50),
-        "rsi14": float(rsi14),
-        "macd": float(macd_val),
-        "macd_signal": float(signal_val),
-        "vol_ratio": float(vol_ratio),
-        "recent_high": float(recent_high),
-        "recent_low": float(recent_low),
-        "signal": signal,
-        "reasons": reasons
-    }
-
-# ------------- News fetching (multi-source lightweight) -------------
-def fetch_idx_announcements(limit=5):
-    """Fetch recent company announcements from IDX API (returns list of dict)"""
+# ================== FETCH BERITA IDX ==================
+def fetch_news_idx(limit=5):
     try:
         url = "https://www.idx.co.id/umbraco/Surface/ListedCompany/GetCompanyAnnouncement"
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        items = data.get("data", [])[:limit]
         results = []
-        for it in items:
-            title = it.get("title") or it.get("announcementTitle") or ""
-            code = it.get("code") or it.get("issuerCode") or ""
-            file_path = it.get("filePath") or ""
-            link = f"https://www.idx.co.id{file_path}" if file_path else ""
-            results.append({"title": title, "code": code, "link": link, "source": "IDX"})
+        for item in data["data"][:limit]:
+            title = item["title"]
+            code = item["code"]
+            link = f"https://www.idx.co.id/{item['filePath']}"
+            results.append({"title": title, "code": code, "link": link})
         return results
-    except Exception:
+    except Exception as e:
+        log(f"Error fetch_news_idx: {e}")
         return []
 
-def fetch_cnbc_headlines(limit=5):
+# ================== FETCH BERITA CNBC ==================
+def fetch_news_cnbc(limit=5):
     try:
-        url = "https://www.cnbcindonesia.com/market"
+        url = "https://api.cnbcindonesia.com/market"
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        items = soup.select("a.box_link")[:limit]
+        data = resp.json()
+        articles = data.get("data", [])
         results = []
-        for a in items:
-            title = a.get_text(strip=True)
-            href = a.get("href")
-            link = href if href.startswith("http") else f"https://www.cnbcindonesia.com{href}"
-            results.append({"title": title, "code": "", "link": link, "source": "CNBC"})
+        for item in articles[:limit]:
+            title = item["title"]
+            link = item["url"]
+            code = extract_ticker(title)
+            results.append({"title": title, "code": code, "link": link})
         return results
-    except Exception:
+    except Exception as e:
+        log(f"Error fetch_news_cnbc: {e}")
         return []
 
+# ================== EKSTRAK TICKER DARI TEKS ==================
+def extract_ticker(text):
+    words = text.split()
+    for w in words:
+        if w.isupper() and w.isalpha() and 3 <= len(w) <= 4:
+            return w
+    return None
+
+# ================== GABUNGKAN BERITA ==================
 def fetch_combined_news(limit=5):
-    # combine IDX announcements and CNBC headlines (de-duplicated by link)
-    news = fetch_idx_announcements(limit=limit) + fetch_cnbc_headlines(limit=limit)
-    seen = set()
-    dedup = []
-    for n in news:
-        link = n.get("link") or n.get("title")
-        if link not in seen:
-            seen.add(link)
-            dedup.append(n)
-    return dedup[:limit]
+    idx_news = fetch_news_idx(limit)
+    cnbc_news = fetch_news_cnbc(limit)
+    return idx_news + cnbc_news
 
-# ------------- Message formatting & send -------------
-def format_ta_message(ta):
-    if not ta:
-        return "❌ Analisis tidak tersedia."
-    s = (f"📊 *{ta['symbol']}*\n"
-         f"Harga: Rp {ta['price']:.0f}\n"
-         f"Signal: *{ta['signal']}*\n"
-         f"EMA20: {ta['ema20']:.0f}  EMA50: {ta['ema50']:.0f}\n"
-         f"RSI14: {ta['rsi14']:.1f}  MACD: {ta['macd']:.2f}\n"
-         f"Volume: {ta['vol_ratio']:.2f}x SMA20\n"
-         f"60d High/Low: {ta['recent_high']:.0f}/{ta['recent_low']:.0f}\n"
-         f"Alasan: {', '.join(ta['reasons'])}\n")
-    return s
+# ================== KIRIM BERITA KE USER ==================
+def send_news_to_all(news_list):
+    for chat_id in load_chat_ids():
+        for item in news_list:
+            code = item["code"]
+            signal = get_signal(code) if code else "📌 Tidak ada kode saham"
+            msg = f"📰 {item['title']} ({code if code else '-'})\n{signal}\n🔗 {item['link']}"
+            try:
+                bot.send_message(chat_id, msg)
+                time.sleep(1)  # rate limit
+            except Exception as e:
+                log(f"Error kirim ke {chat_id}: {e}")
 
-def send_news_to(chat_id, limit=3):
-    news = fetch_combined_news(limit=limit)
-    if not news:
-        bot.send_message(chat_id, "Tidak menemukan berita terbaru saat ini.")
-        return
-    for item in news:
-        title = item.get("title")
-        source = item.get("source")
-        link = item.get("link")
-        # try get a ticker code from IDX item if exists
-        code = item.get("code") or ""
-        msg = f"📰 *{title}*\n_Source: {source}_\n{link}\n\n"
-        if code:
-            ta = analyze_ticker(code)
-            msg += format_ta_message(ta)
-        else:
-            # try to guess tickers from title (simple heuristic: uppercase tokens)
-            tokens = [t for t in title.split() if t.isupper() and len(t) <= 6]
-            if tokens:
-                ta = analyze_ticker(tokens[0])
-                msg += format_ta_message(ta)
-            else:
-                msg += "_No ticker detected for TA._\n"
-        bot.send_message(chat_id, msg, parse_mode="Markdown")
-
-# ------------- Commands -------------
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
-    save_chat_id(message.chat.id)
-    bot.reply_to(message, ("✅ Kamu terdaftar. Bot akan mengirim berita & sinyal otomatis.\n"
-                           "Perintah:\n"
-                           "/berita - minta berita terbaru sekarang\n"
-                           "/rekomendasi - rekomendasi saham harian (TA)\n"
-                           "/stop - hentikan notifikasi"))
-    # send immediate latest news once
-    try:
-        send_news_to(message.chat.id, limit=1)
-    except Exception:
-        pass
-
-@bot.message_handler(commands=["stop"])
-def cmd_stop(message):
-    remove_chat_id(message.chat.id)
-    bot.reply_to(message, "❌ Kamu berhenti menerima notifikasi.")
-
-@bot.message_handler(commands=["berita"])
-def cmd_berita(message):
-    bot.reply_to(message, "🔎 Mencari berita terbaru... Mohon tunggu sebentar.")
-    send_news_to(message.chat.id, limit=3)
-
-@bot.message_handler(commands=["rekomendasi"])
-def cmd_rekomendasi(message):
-    bot.reply_to(message, "🔍 Sedang memproses rekomendasi saham harian... Mohon tunggu.")
-    tickers = DEFAULT_TICKERS
-    results = []
-    for t in tickers:
-        ta = analyze_ticker(t)
-        if ta:
-            results.append(f"{t} → *{ta['signal']}* (Rp {ta['price']:.0f})")
-        else:
-            results.append(f"{t} → ❌ tidak tersedia")
-    reply = "*Rekomendasi Saham Harian*\n" + "\n".join(results)
-    bot.send_message(message.chat.id, reply, parse_mode="Markdown")
-
-# ------------- Auto-send loop -------------
+# ================== LOOP OTOMATIS ==================
 def auto_send_loop():
+    global last_sent_links
     while True:
         try:
-            ids = load_chat_ids()
-            if ids:
-                news = fetch_combined_news(limit=3)
-                for cid in ids:
-                    for item in news:
-                        # build message same as send_news_to but for each subscriber
-                        title = item.get("title")
-                        source = item.get("source")
-                        link = item.get("link")
-                        code = item.get("code") or ""
-                        msg = f"📰 *{title}*\n_Source: {source}_\n{link}\n\n"
-                        if code:
-                            ta = analyze_ticker(code)
-                            msg += format_ta_message(ta)
-                        else:
-                            tokens = [t for t in title.split() if t.isupper() and len(t) <= 6]
-                            if tokens:
-                                ta = analyze_ticker(tokens[0])
-                                msg += format_ta_message(ta)
-                            else:
-                                msg += "_No ticker detected for TA._\n"
-                        try:
-                            bot.send_message(cid, msg, parse_mode="Markdown")
-                        except Exception:
-                            # ignore per-recipient failures (bot might be blocked)
-                            pass
-            time.sleep(CHECK_INTERVAL)
+            news_list = fetch_combined_news(limit=5)
+            new_items = [n for n in news_list if n["link"] not in last_sent_links]
+
+            if new_items:
+                send_news_to_all(new_items)
+                last_sent_links.update(n["link"] for n in new_items)
+                log(f"📢 Kirim {len(new_items)} berita baru")
+            else:
+                log("⏳ Tidak ada berita baru")
+
         except Exception as e:
-            print("Error in auto_send_loop:", e)
-            time.sleep(60)
+            log(f"Error auto_send_loop: {e}")
 
-# ------------- Start background sender & bot polling -------------
+        time.sleep(CHECK_INTERVAL)
+
+# ================== COMMAND TELEGRAM ==================
+@bot.message_handler(commands=["start"])
+def start(message):
+    save_chat_id(message.chat.id)
+    bot.reply_to(message, "✅ Chat ID tersimpan. Kamu akan menerima update berita & rekomendasi saham otomatis.")
+
+@bot.message_handler(commands=["berita"])
+def berita_manual(message):
+    news_list = fetch_combined_news(limit=5)
+    send_news_to_all(news_list)
+
+@bot.message_handler(commands=["rekomendasi"])
+def rekomendasi_manual(message):
+    kode_saham = ["BBRI", "BBCA", "TLKM", "ASII", "BMRI"]
+    rekom = []
+    for kode in kode_saham:
+        rekom.append(f"{kode}: {get_signal(kode)}")
+    bot.reply_to(message, "\n".join(rekom))
+
+# ================== MAIN ==================
 if __name__ == "__main__":
-    # start background thread
-    t = threading.Thread(target=auto_send_loop, daemon=True)
-    t.start()
+    if load_chat_ids():
+        bot.send_message(load_chat_ids()[0], "🚀 Bot dimulai!")
+    else:
+        log("Belum ada chat ID tersimpan. Kirim /start di Telegram.")
 
-    print("Bot starting polling... (Ctrl+C to stop)")
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    Thread(target=auto_send_loop, daemon=True).start()
+    bot.polling(non_stop=True)

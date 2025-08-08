@@ -7,3 +7,7 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         value: "8433631932:AAGlzeHsbHeIEsgMB7D0wnD6y9zbrI0eKKo"
+      - key: CHECK_INTERVAL_SEC
+        value: "300"
+      - key: DEFAULT_TICKERS
+        value: "BBCA,BBRI,BMRI,TLKM,ASII,UNVR,ICBP,ADRO,ANTM,MDKA"

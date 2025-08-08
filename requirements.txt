@@ -1,8 +1,7 @@
-Flask
-gunicorn
-requests
-yfinance
-pandas
 python-telegram-bot==20.3
-beautifulsoup4
-lxml
+Flask
+yfinance
+pillow
+requests
+pandas
+numpy

@@ -1,6 +1,4 @@
 pyTelegramBotAPI
-beautifulsoup4
-requests
 pandas
-yfinance
+requests
 TA-Lib

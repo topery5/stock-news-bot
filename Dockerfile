@@ -1,39 +1,25 @@
-# Dockerfile — build environment with TA-Lib compiled from source
+# Gunakan Python 3.10 (lebih stabil untuk TA-Lib)
 FROM python:3.10-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
+# Install dependencies TA-Lib
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3-dev \
+    wget \
+    && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
+    && tar -xzf ta-lib-0.4.0-src.tar.gz \
+    && cd ta-lib && ./configure --prefix=/usr && make && make install \
+    && cd .. && rm -rf ta-lib ta-lib-0.4.0-src.tar.gz \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Set workdir
 WORKDIR /app
 
-# Install OS-level build deps required by TA-Lib and common utils
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    wget \
-    curl \
-    unzip \
-    libz-dev \
-    libbz2-dev \
-    libssl-dev \
-    libffi-dev \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Copy semua file ke container
+COPY . .
 
-# Install TA-Lib from source (v0.4.0)
-RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz -O /tmp/ta-lib.tar.gz \
-    && mkdir -p /tmp/ta-lib-src \
-    && tar -xzf /tmp/ta-lib.tar.gz -C /tmp/ta-lib-src --strip-components=1 \
-    && cd /tmp/ta-lib-src && ./configure --prefix=/usr && make && make install \
-    && rm -rf /tmp/ta-lib.tar.gz /tmp/ta-lib-src
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy requirements and install Python deps
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-# Copy source
-COPY . /app
-
-ENV PYTHONUNBUFFERED=1
-ENV LANG=C.UTF-8
-
-# Run bot
+# Jalankan bot
 CMD ["python", "bot.py"]

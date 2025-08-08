@@ -309,4 +309,4 @@ if __name__ == "__main__":
     log.info("Setting webhook (HTTP)...")
     ensure_webhook_set()
     # run Flask (Gunicorn will use WSGI in production)
-    flask_app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=PORT)

@@ -1,100 +1,93 @@
+import telebot
 import os
+import json
 import time
 import requests
-import telebot
-from bs4 import BeautifulSoup
+from datetime import datetime
 import pandas as pd
-import yfinance as yf
+import talib
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
-CHAT_IDS_FILE = "chat_ids.txt"
+CHAT_ID_FILE = "chat_ids.json"
 
-# Simpan chat_id secara otomatis
-def save_chat_id(chat_id):
-    if not os.path.exists(CHAT_IDS_FILE):
-        with open(CHAT_IDS_FILE, "w") as f:
-            f.write(str(chat_id) + "\n")
-    else:
-        with open(CHAT_IDS_FILE, "r") as f:
-            ids = f.read().splitlines()
-        if str(chat_id) not in ids:
-            with open(CHAT_IDS_FILE, "a") as f:
-                f.write(str(chat_id) + "\n")
-
+# ====== Utility Chat ID ======
 def load_chat_ids():
-    if not os.path.exists(CHAT_IDS_FILE):
-        return []
-    with open(CHAT_IDS_FILE, "r") as f:
-        return f.read().splitlines()
+    if os.path.exists(CHAT_ID_FILE):
+        with open(CHAT_ID_FILE, "r") as f:
+            return json.load(f)
+    return []
 
-# Ambil berita saham (contoh CNBC)
-def get_latest_news():
-    url = "https://www.cnbcindonesia.com/market"
-    resp = requests.get(url)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    articles = soup.find_all("a", class_="box_link")
-    news_list = []
-    for art in articles[:3]:
-        title = art.get_text(strip=True)
-        link = art["href"]
-        if not link.startswith("http"):
-            link = "https://www.cnbcindonesia.com" + link
-        news_list.append({"title": title, "link": link})
-    return news_list
+def save_chat_id(chat_id):
+    ids = load_chat_ids()
+    if chat_id not in ids:
+        ids.append(chat_id)
+        with open(CHAT_ID_FILE, "w") as f:
+            json.dump(ids, f)
 
-# Analisis teknikal sederhana
-def technical_analysis(ticker):
-    try:
-        data = yf.download(ticker+".JK", period="3mo", interval="1d")
-        if data.empty:
-            return "Data tidak ditemukan"
-        close = data["Close"]
-        sma5 = close.rolling(5).mean().iloc[-1]
-        sma20 = close.rolling(20).mean().iloc[-1]
-        last_price = close.iloc[-1]
-        if last_price > sma5 > sma20:
-            signal = "BUY ✅ (Bullish)"
-        elif last_price < sma5 < sma20:
-            signal = "SELL ❌ (Bearish)"
-        else:
-            signal = "WAIT ⏳ (Sideways)"
-        return f"Harga terakhir: {last_price:.2f}\nSMA5: {sma5:.2f}\nSMA20: {sma20:.2f}\nSinyal: {signal}"
-    except:
-        return "Error analisis"
-
-# Kirim pesan ke semua subscriber
-def broadcast():
-    news = get_latest_news()
-    for n in news:
-        ticker_guess = n["title"].split()[0]
-        ta = technical_analysis(ticker_guess)
-        msg = f"📢 *{n['title']}*\n{n['link']}\n\n📊 Analisis:\n{ta}"
-        for cid in load_chat_ids():
-            bot.send_message(cid, msg, parse_mode="Markdown")
-
+# ====== Command Start ======
 @bot.message_handler(commands=["start"])
 def start(message):
     save_chat_id(message.chat.id)
-    bot.reply_to(message, "✅ Kamu sudah terdaftar untuk menerima berita saham setiap 5 menit.")
+    bot.reply_to(message, "✅ Chat ID kamu tersimpan. Bot akan mengirim update otomatis setiap ada berita atau sinyal.")
 
-@bot.message_handler(commands=["stop"])
-def stop(message):
-    if os.path.exists(CHAT_IDS_FILE):
-        with open(CHAT_IDS_FILE, "r") as f:
-            ids = f.read().splitlines()
-        ids = [i for i in ids if i != str(message.chat.id)]
-        with open(CHAT_IDS_FILE, "w") as f:
-            f.write("\n".join(ids))
-    bot.reply_to(message, "❌ Kamu telah berhenti menerima berita.")
+# ====== Analisis Teknikal ======
+def get_signal(symbol):
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/download/{symbol}.JK?period1=1700000000&period2=9999999999&interval=1d&events=history"
+        df = pd.read_csv(url)
+        df['SMA20'] = talib.SMA(df['Close'], timeperiod=20)
+        df['SMA50'] = talib.SMA(df['Close'], timeperiod=50)
+        last = df.iloc[-1]
 
-if __name__ == "__main__":
-    bot.send_message(load_chat_ids()[0] if load_chat_ids() else message.chat.id, "🚀 Bot dimulai!")
+        if last['SMA20'] > last['SMA50']:
+            return "📈 BUY (Uptrend)"
+        elif last['SMA20'] < last['SMA50']:
+            return "📉 SELL (Downtrend)"
+        else:
+            return "⚖️ NETRAL"
+    except:
+        return "❌ Data tidak tersedia"
+
+# ====== Cek Berita ======
+def fetch_news():
+    try:
+        url = "https://www.idx.co.id/umbraco/Surface/ListedCompany/GetCompanyAnnouncement"
+        resp = requests.get(url)
+        if resp.status_code == 200:
+            data = resp.json()
+            results = []
+            for item in data['data'][:5]:  # ambil 5 berita terbaru
+                title = item['title']
+                code = item['code']
+                link = f"https://www.idx.co.id/{item['filePath']}"
+                signal = get_signal(code)
+                results.append(f"📰 {title} ({code})\n{signal}\n{link}")
+            return results
+        return []
+    except Exception as e:
+        print(f"Error fetch_news: {e}")
+        return []
+
+# ====== Kirim Otomatis ======
+def auto_send():
     while True:
-        try:
-            broadcast()
-            time.sleep(300)  # 5 menit
-        except Exception as e:
-            print("Error:", e)
-            time.sleep(60)
+        news_list = fetch_news()
+        if news_list:
+            for chat_id in load_chat_ids():
+                for news in news_list:
+                    bot.send_message(chat_id, news)
+        time.sleep(300)  # cek tiap 5 menit
+
+# ====== Startup ======
+chat_ids = load_chat_ids()
+if chat_ids:
+    bot.send_message(chat_ids[0], "🚀 Bot dimulai!")
+else:
+    print("Belum ada chat ID tersimpan. Kirim /start ke bot di Telegram.")
+
+import threading
+threading.Thread(target=auto_send, daemon=True).start()
+
+bot.polling(non_stop=True)

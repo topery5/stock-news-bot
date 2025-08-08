@@ -410,5 +410,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=auto_send_loop, daemon=True)
     t.start()
     # run Flask (Railway/Gunicorn will actually run via web: gunicorn bot:app)
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
